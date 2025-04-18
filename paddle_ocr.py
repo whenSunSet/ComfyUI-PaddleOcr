@@ -2,6 +2,7 @@ import kornia
 import torch
 from paddleocr import PaddleOCR
 import comfy.model_management
+import json
 
 
 class OcrBoxMask:
@@ -30,44 +31,32 @@ class OcrBoxMask:
             self.lang = lang
             del self.ocr
             self.ocr = PaddleOCR(use_angle_cls=True, lang=self.lang, show_log=False)
+
         masks = []
-        for (batch_number, image) in enumerate(images):
+        words = text.split(";")
+        
+        for image in images:
             i = 255. * image.cpu().numpy()
             shape = i.shape
-            mask = torch.zeros((shape[0], shape[1]), dtype=torch.uint8)
-            words = text.split(";")
-            result = self.ocr.ocr(i, cls=False)
-            for idx in range(len(result)):
-                res = result[idx]
+            mask = torch.zeros((shape[0], shape[1]), dtype=torch.float32)
+            
+            orc_ret = self.ocr.ocr(i, cls=False)
+            for idx in range(len(orc_ret)):
+                res = orc_ret[idx]
                 if res is not None:
                     for line in res:
-                        # print(line[1][0])
-                        for word in words:
-                            if word == "":
-                                continue
-                            if text == "" or line[1][0].find(word) >= 0:
-                                text_line = line[1][0]
+                        if line[1][0] != "":
+                            if text == "" or any(word in line[1][0] for word in words if word != ""):
                                 points = line[0]
-                                if points[0][1] > 1:
-                                    points[0][1] -= 1
-                                if points[2][1] < shape[0] - 1:
-                                    points[2][1] += 1
-                                total_length = len(text_line)
-                                start = 0
-                                while text_line.find(word, start) >= 0:
-                                    start = text_line.find(word, start)
-                                    end = start + len(word)
-                                    x_min = points[0][0] + start * (points[1][0] - points[0][0]) / total_length
-                                    x_max = points[0][0] + end * (points[1][0] - points[0][0]) / total_length
-                                    if x_min > 1:
-                                        x_min -= 1
-                                    if x_max < shape[1] - 1:
-                                        x_max += 1
-
-                                    mask[int(points[0][1]):int(points[2][1]), int(x_min):int(x_max)] = 1
-                                    start = end
-            masks.append(mask.unsqueeze(0))
-        return (torch.cat(masks, dim=0),)
+                                x_coords = [p[0] for p in points]
+                                y_coords = [p[1] for p in points]
+                                x1, x2 = int(min(x_coords)), int(max(x_coords))
+                                y1, y2 = int(min(y_coords)), int(max(y_coords))
+                                mask[y1:y2, x1:x2] = 1.0
+            
+            masks.append(mask)
+        
+        return (torch.stack(masks, dim=0),)
 
 
 class OcrImageText:
@@ -96,22 +85,28 @@ class OcrImageText:
             del self.ocr
             self.ocr = PaddleOCR(use_angle_cls=True, lang=self.lang, show_log=False)
 
-        text = ""
-        last_text = ""
-        for image in images:
+        json_result = []  # Store JSON results
+        
+        for image_idx, image in enumerate(images):
             i = 255. * image.cpu().numpy()
-            now_text = ""
+            image_data = {"image_index": image_idx, "texts": []}
+            
             orc_ret = self.ocr.ocr(i, cls=False)
             for idx in range(len(orc_ret)):
                 res = orc_ret[idx]
                 if res is not None:
                     for line in res:
                         if line[1][0] != "":
-                            now_text += line[1][0] + "\n"
-            if now_text != "" and now_text != last_text:
-                text += now_text + "\n"
-                last_text = now_text
-        return (text,)
+                            image_data["texts"].append({
+                                "text": line[1][0],
+                                "confidence": float(line[1][1]),
+                                "bbox": [[float(x), float(y)] for x, y in line[0]]
+                            })
+            
+            if len(image_data["texts"]) > 0:
+                json_result.append(image_data)
+        
+        return (json.dumps(json_result, ensure_ascii=False, indent=2),)
 
 
 class OcrBlur:
